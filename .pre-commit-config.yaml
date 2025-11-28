@@ -1,0 +1,21 @@
+# Pre-commit configuration with auto-fix behavior
+# If ruff fixes all issues automatically, the commit proceeds
+# Install: pip install pre-commit && pre-commit install
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.4
+    hooks:
+      # Run ruff linter with auto-fix
+      - id: ruff
+        args: [--fix, --exit-zero]
+      # Run ruff formatter
+      - id: ruff-format
+
+  # Re-run ruff check after fixes to catch any remaining issues
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.4
+    hooks:
+      - id: ruff
+        name: ruff-check-final
+        # No --fix here, just check. If auto-fix resolved everything, this passes.
