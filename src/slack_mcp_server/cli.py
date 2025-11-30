@@ -39,14 +39,13 @@ def main() -> None:
         description="Slack MCP Server - A powerful MCP server for Slack workspaces",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Authentication (one of these is required):
-  --xoxp-token       User OAuth token (xoxp-...)
-  --xoxc-token       Browser token (xoxc-...) with --xoxd-token
+Authentication:
+  --bot-token        Bot OAuth token (xoxb-...) - required
+  --user-token       User OAuth token (xoxp-...) - optional, for search
 
 Environment Variables:
-  SLACK_MCP_XOXP_TOKEN         User OAuth token
-  SLACK_MCP_XOXC_TOKEN         Browser token
-  SLACK_MCP_XOXD_TOKEN         Browser cookie d value
+  SLACK_MCP_BOT_TOKEN          Bot OAuth token (xoxb-...) - required
+  SLACK_MCP_USER_TOKEN         User OAuth token (xoxp-...) - optional, for search
   SLACK_MCP_ADD_MESSAGE_TOOL   Enable message posting (true/1/channel-list)
   SLACK_MCP_ADD_MESSAGE_MARK   Mark messages as read after posting
   SLACK_MCP_ADD_MESSAGE_UNFURLING  Control link unfurling (yes/domain-list)
@@ -56,34 +55,27 @@ Environment Variables:
   SLACK_MCP_LOG_FORMAT         Log format (json/console)
 
 Example:
-  # Using uvx with OAuth token
-  uvx --from git+https://github.com/korotovsky/slack-mcp-server slack-mcp-server \\
-      --xoxp-token xoxp-your-token
+  # Using bot token only
+  slack-mcp-server --bot-token xoxb-your-bot-token
 
-  # Using browser tokens
-  slack-mcp-server --xoxc-token xoxc-... --xoxd-token xoxd-...
+  # Using both bot and user tokens (enables search)
+  slack-mcp-server --bot-token xoxb-your-bot-token --user-token xoxp-your-user-token
 """,
     )
 
     # Authentication options
     auth_group = parser.add_argument_group("Authentication")
     auth_group.add_argument(
-        "--xoxp-token",
-        dest="xoxp_token",
-        help="User OAuth token (xoxp-...)",
-        default=os.environ.get("SLACK_MCP_XOXP_TOKEN"),
+        "--bot-token",
+        dest="bot_token",
+        help="Bot OAuth token (xoxb-...) - required",
+        default=os.environ.get("SLACK_MCP_BOT_TOKEN"),
     )
     auth_group.add_argument(
-        "--xoxc-token",
-        dest="xoxc_token",
-        help="Browser token (xoxc-...)",
-        default=os.environ.get("SLACK_MCP_XOXC_TOKEN"),
-    )
-    auth_group.add_argument(
-        "--xoxd-token",
-        dest="xoxd_token",
-        help="Browser cookie d value (xoxd-...)",
-        default=os.environ.get("SLACK_MCP_XOXD_TOKEN"),
+        "--user-token",
+        dest="user_token",
+        help="User OAuth token (xoxp-...) - optional, for search",
+        default=os.environ.get("SLACK_MCP_USER_TOKEN"),
     )
 
     # Cache options
@@ -129,10 +121,8 @@ Example:
     logger = logging.getLogger(__name__)
 
     # Validate authentication
-    if not args.xoxp_token and not (args.xoxc_token and args.xoxd_token):
-        parser.error(
-            "Authentication required: Either --xoxp-token or both --xoxc-token and --xoxd-token must be provided"
-        )
+    if not args.bot_token:
+        parser.error("Authentication required: --bot-token must be provided")
 
     logger.info(f"Starting Slack MCP Server v{__version__}")
 
@@ -141,9 +131,8 @@ Example:
 
     try:
         provider = init_provider(
-            xoxp_token=args.xoxp_token,
-            xoxc_token=args.xoxc_token,
-            xoxd_token=args.xoxd_token,
+            bot_token=args.bot_token,
+            user_token=args.user_token,
             users_cache_path=args.users_cache,
             channels_cache_path=args.channels_cache,
         )

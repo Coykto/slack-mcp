@@ -4,3 +4,5 @@ description: Use this agent PROACTIVELY when you need expert Python development 
 model: sonnet
 color: blue
 ---
+
+NEVER USE ANY LINTER OR FORMATTER EVER

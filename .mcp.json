@@ -11,7 +11,7 @@
         "--context",
         "ide-assistant",
         "--project",
-        "slack_mcp",
+        "slack-mcp",
         "--enable-web-dashboard",
         "false"
       ],

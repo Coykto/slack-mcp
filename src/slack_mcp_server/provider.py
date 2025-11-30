@@ -48,38 +48,33 @@ class SlackProvider:
 
     def __init__(
         self,
-        xoxp_token: str | None = None,
-        xoxc_token: str | None = None,
-        xoxd_token: str | None = None,
+        bot_token: str | None = None,
+        user_token: str | None = None,
         users_cache_path: str | None = None,
         channels_cache_path: str | None = None,
     ):
         """Initialize the Slack provider.
 
         Args:
-            xoxp_token: User OAuth token (xoxp-...)
-            xoxc_token: Browser token (xoxc-...)
-            xoxd_token: Browser cookie d value (xoxd-...)
+            bot_token: Bot OAuth token (xoxb-...) - used for most operations
+            user_token: User OAuth token (xoxp-...) - used for search operations
             users_cache_path: Path to users cache file
             channels_cache_path: Path to channels cache file
         """
-        # Determine which token to use
-        token = xoxp_token or xoxc_token
-        if not token:
-            raise ValueError(
-                "Authentication required: Either xoxp_token (User OAuth) or "
-                "both xoxc_token and xoxd_token (session-based) must be provided"
-            )
-
-        # For xoxc tokens, we need cookies
-        headers = {}
-        if xoxc_token and xoxd_token:
-            headers["Cookie"] = f"d={xoxd_token}"
+        if not bot_token:
+            raise ValueError("Authentication required: bot_token must be provided")
 
         # Create SSL context with certifi certificates (fixes macOS SSL issues)
         ssl_context = ssl.create_default_context(cafile=certifi.where())
 
-        self.client = WebClient(token=token, headers=headers if headers else None, ssl=ssl_context)
+        # Primary client (bot token) - used for most operations
+        self.client = WebClient(token=bot_token, ssl=ssl_context)
+
+        # User client (user token) - used for search operations
+        self.user_client: WebClient | None = None
+        if user_token:
+            self.user_client = WebClient(token=user_token, ssl=ssl_context)
+
         self._workspace: str | None = None
         self._team_id: str | None = None
         self._user_id: str | None = None
@@ -204,10 +199,14 @@ class SlackProvider:
 
     # ---------- Channel Cache Methods ----------
 
-    def refresh_channels(self) -> None:
-        """Load channels from cache or fetch from API."""
-        # Try loading from cache first
-        if self.channels_cache_path.exists():
+    def refresh_channels(self, force: bool = False) -> None:
+        """Load channels from cache or fetch from API.
+
+        Args:
+            force: If True, skip cache and fetch directly from API.
+        """
+        # Try loading from cache first (unless force=True)
+        if not force and self.channels_cache_path.exists():
             try:
                 with open(self.channels_cache_path) as f:
                     cached_channels = json.load(f)
@@ -388,6 +387,11 @@ class SlackProvider:
                 result.append(channel)
 
         return result
+
+    @property
+    def user_id(self) -> str | None:
+        """Get the authenticated user ID."""
+        return self._user_id
 
     @property
     def users(self) -> dict[str, User]:

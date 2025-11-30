@@ -30,18 +30,16 @@ def get_provider() -> SlackProvider:
 
 
 def init_provider(
-    xoxp_token: str | None = None,
-    xoxc_token: str | None = None,
-    xoxd_token: str | None = None,
+    bot_token: str | None = None,
+    user_token: str | None = None,
     users_cache_path: str | None = None,
     channels_cache_path: str | None = None,
 ) -> SlackProvider:
     """Initialize the global Slack provider."""
     global _provider
     _provider = SlackProvider(
-        xoxp_token=xoxp_token,
-        xoxc_token=xoxc_token,
-        xoxd_token=xoxd_token,
+        bot_token=bot_token,
+        user_token=user_token,
         users_cache_path=users_cache_path,
         channels_cache_path=channels_cache_path,
     )
@@ -55,7 +53,18 @@ mcp = FastMCP(
 )
 
 
+# ---------- Constants ----------
+
+MCP_MARKER = "[managed by slack-mcp]"
+
+
 # ---------- Helper Functions ----------
+
+
+def is_channel_management_enabled() -> bool:
+    """Check if channel management is enabled via environment variable."""
+    config = os.environ.get("SLACK_MCP_CHANNEL_MANAGEMENT", "")
+    return config.lower() in ("true", "1", "yes")
 
 
 def messages_to_csv(messages: list[dict[str, Any]]) -> str:
@@ -94,6 +103,24 @@ def users_to_csv(users: list[dict[str, Any]]) -> str:
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
     writer.writerows(users)
+    return output.getvalue()
+
+
+def channel_info_to_csv(channel_info: dict[str, Any]) -> str:
+    """Convert channel info dict to CSV format.
+
+    Args:
+        channel_info: Channel information dict with keys:
+            channelID, name, is_private, creator, purpose, is_new
+
+    Returns:
+        CSV formatted string with channel information.
+    """
+    output = io.StringIO()
+    fieldnames = ["channelID", "name", "is_private", "creator", "purpose", "is_new"]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerow(channel_info)
     return output.getvalue()
 
 
@@ -202,6 +229,62 @@ def is_channel_allowed(channel_id: str) -> bool:
                 return True
 
     return is_negated  # Allow if negation pattern and not in blocklist
+
+
+def check_channel_ownership(provider: SlackProvider, channel_id: str) -> tuple[bool, dict[str, Any]]:
+    """Check if a channel is owned by this MCP instance.
+
+    A channel is considered owned if:
+    1. The creator field matches the current authenticated user, AND
+    2. The channel purpose/description contains the MCP marker
+
+    Args:
+        provider: The Slack provider instance
+        channel_id: The channel ID to check
+
+    Returns:
+        Tuple of (is_owned, channel_info):
+            - is_owned: True if channel is MCP-managed by current user
+            - channel_info: Full channel info from Slack API
+    """
+    try:
+        response = provider.client.conversations_info(channel=channel_id)
+        channel = response["channel"]
+
+        creator = channel.get("creator", "")
+        purpose = channel.get("purpose", {}).get("value", "")
+
+        is_owned = (creator == provider.user_id) and (MCP_MARKER in purpose)
+        return is_owned, channel
+
+    except SlackApiError as e:
+        logger.error(f"Failed to check channel ownership for {channel_id}: {e}")
+        raise RuntimeError(f"Failed to check channel ownership: {e.response.get('error', 'unknown_error')}") from e
+
+
+def resolve_user_list(provider: SlackProvider, user_refs: str) -> list[str]:
+    """Resolve comma-separated user references to user IDs.
+
+    Args:
+        provider: The Slack provider instance
+        user_refs: Comma-separated user IDs or @mentions (e.g., "U123,@alice,U456")
+
+    Returns:
+        List of resolved user IDs
+
+    Raises:
+        ValueError: If any user reference cannot be resolved
+    """
+    user_ids = []
+    for ref in user_refs.split(","):
+        ref = ref.strip()
+        if not ref:
+            continue
+        resolved = provider.resolve_user(ref)
+        if not resolved:
+            raise ValueError(f"User '{ref}' not found")
+        user_ids.append(resolved)
+    return user_ids
 
 
 # ---------- Conversation Tools ----------
@@ -426,6 +509,12 @@ def conversations_search_messages(
     """Search messages with filters. Returns CSV with cursor in last row for pagination."""
     provider = get_provider()
 
+    # Search requires a user token (xoxp-), not a bot token
+    if not provider.user_client:
+        raise ValueError(
+            "Search requires a user token. Set SLACK_MCP_USER_TOKEN environment variable."
+        )
+
     # Build query string
     query_parts = []
 
@@ -485,7 +574,7 @@ def conversations_search_messages(
             raise ValueError(f"Invalid cursor: {cursor}")
 
     try:
-        response = provider.client.search_messages(query=query, count=limit, page=page, highlight=False)
+        response = provider.user_client.search_messages(query=query, count=limit, page=page, highlight=False)
         matches = response.get("messages", {}).get("matches", [])
         pagination = response.get("messages", {}).get("pagination", {})
 
@@ -611,6 +700,274 @@ def channels_list(
         channels[-1]["cursor"] = next_cursor
 
     return channels_to_csv(channels)
+
+
+@mcp.tool
+def channels_create(
+    name: Annotated[str, Field(description="Channel name (lowercase, numbers, hyphens, underscores; max 80 chars)")],
+    is_private: Annotated[bool, Field(description="Create as private channel")] = False,
+    description: Annotated[str | None, Field(description="Channel description/purpose")] = None,
+) -> str:
+    """Create a new Slack channel (idempotent). Returns channel info as CSV.
+
+    If a channel with the given name already exists and is managed by this MCP
+    instance (created by current user with MCP marker), it will be returned
+    instead of creating a new one.
+
+    If a channel exists but is NOT managed by this MCP, an error is raised.
+    """
+    provider = get_provider()
+
+    # Check if feature is enabled
+    if not is_channel_management_enabled():
+        raise ValueError(
+            "Channel management is disabled. Set SLACK_MCP_CHANNEL_MANAGEMENT=true to enable this feature."
+        )
+
+    # Validate channel name
+    if not name:
+        raise ValueError("Channel name cannot be empty")
+
+    if len(name) > 80:
+        raise ValueError(f"Channel name too long: {len(name)} chars (max 80)")
+
+    # Channel name must be lowercase alphanumeric with hyphens/underscores
+    if not re.match(r"^[a-z0-9_-]+$", name):
+        raise ValueError(
+            "Channel name must be lowercase alphanumeric with hyphens/underscores only. "
+            f"Invalid name: '{name}'"
+        )
+
+    # Check if channel already exists in cache
+    # Channels are stored with '#' prefix in the cache (e.g., '#my-channel')
+    cached_channel_id = provider._channels_inv.get(f"#{name}")
+
+    if cached_channel_id:
+        # Channel exists - check ownership
+        is_owned, channel_data = check_channel_ownership(provider, cached_channel_id)
+
+        if is_owned:
+            # Channel is MCP-managed - return it (idempotent behavior)
+            channel_info = {
+                "channelID": cached_channel_id,
+                "name": name,
+                "is_private": channel_data.get("is_private", False),
+                "creator": channel_data.get("creator", ""),
+                "purpose": channel_data.get("purpose", {}).get("value", ""),
+                "is_new": False,
+            }
+            return channel_info_to_csv(channel_info)
+        else:
+            # Channel exists but not managed by this MCP
+            raise ValueError(
+                f"Channel '#{name}' already exists but is not managed by this MCP instance. "
+                f"Cannot create or modify channels not created by this MCP."
+            )
+
+    try:
+        # Create the channel
+        response = provider.client.conversations_create(
+            name=name,
+            is_private=is_private,
+        )
+
+        channel_data = response.get("channel", {})
+        channel_id = channel_data.get("id", "")
+        creator_id = channel_data.get("creator", "")
+
+        # Build purpose string with MCP marker
+        if description:
+            purpose_string = f"{description} {MCP_MARKER}"
+        else:
+            purpose_string = MCP_MARKER
+
+        # Set the channel purpose
+        provider.client.conversations_setPurpose(
+            channel=channel_id,
+            purpose=purpose_string,
+        )
+
+        # Refresh channel cache to include the new channel (force API fetch)
+        provider.refresh_channels(force=True)
+
+        # Build response
+        channel_info = {
+            "channelID": channel_id,
+            "name": name,
+            "is_private": is_private,
+            "creator": creator_id,
+            "purpose": purpose_string,
+            "is_new": True,
+        }
+
+        return channel_info_to_csv(channel_info)
+
+    except SlackApiError as e:
+        error_msg = e.response.get("error", "unknown_error")
+
+        # Handle race condition: channel was created between our check and create
+        if error_msg == "name_taken":
+            # Refresh channel cache to get the newly created channel (force API fetch)
+            provider.refresh_channels(force=True)
+
+            # Try to find the channel again
+            cached_channel_id = provider._channels_inv.get(f"#{name}")
+            if cached_channel_id:
+                # Check ownership
+                is_owned, channel_data = check_channel_ownership(provider, cached_channel_id)
+
+                if is_owned:
+                    # Channel is MCP-managed - return it
+                    channel_info = {
+                        "channelID": cached_channel_id,
+                        "name": name,
+                        "is_private": channel_data.get("is_private", False),
+                        "creator": channel_data.get("creator", ""),
+                        "purpose": channel_data.get("purpose", {}).get("value", ""),
+                        "is_new": False,
+                    }
+                    return channel_info_to_csv(channel_info)
+                else:
+                    # Channel exists but not managed by this MCP
+                    raise ValueError(
+                        f"Channel '#{name}' already exists but is not managed by this MCP instance. "
+                        f"Cannot create or modify channels not created by this MCP."
+                    )
+            else:
+                # Channel not found even after refresh - unusual case
+                raise RuntimeError(
+                    f"Channel '#{name}' was reported as taken but could not be found in channel list."
+                )
+
+        # Re-raise other API errors
+        raise RuntimeError(f"Slack API error: {error_msg}") from e
+
+
+@mcp.tool
+def channels_invite_users(
+    channel_id: Annotated[str, Field(description="Channel ID or name (e.g., C1234567890 or #project-alpha)")],
+    user_ids: Annotated[str, Field(description="Comma-separated user IDs or @mentions (e.g., 'U123,U456' or '@alice,@bob')")],
+) -> str:
+    """Invite users to a Slack channel. Returns result as CSV.
+
+    This tool invites one or more users to a specified channel. Users already
+    in the channel are silently skipped (idempotent behavior).
+
+    Requires SLACK_MCP_CHANNEL_MANAGEMENT=true to be enabled.
+    """
+    provider = get_provider()
+
+    # Check if feature is enabled
+    if not is_channel_management_enabled():
+        raise ValueError(
+            "Channel management is disabled. Set SLACK_MCP_CHANNEL_MANAGEMENT=true to enable this feature."
+        )
+
+    # Resolve channel reference to ID
+    resolved_channel = provider.resolve_channel(channel_id)
+    if not resolved_channel:
+        raise ValueError(f"Channel '{channel_id}' not found.")
+
+    # Resolve user references to IDs
+    try:
+        user_id_list = resolve_user_list(provider, user_ids)
+    except ValueError as e:
+        raise ValueError(f"Failed to resolve users: {e}") from e
+
+    if not user_id_list:
+        raise ValueError("No valid users specified")
+
+    # Track results
+    invited_users = []
+    already_members = []
+
+    # Invite users one by one to handle already_in_channel gracefully
+    for user_id in user_id_list:
+        try:
+            provider.client.conversations_invite(
+                channel=resolved_channel,
+                users=user_id,
+            )
+            invited_users.append(user_id)
+        except SlackApiError as e:
+            error_msg = e.response.get("error", "unknown_error")
+            if error_msg == "already_in_channel":
+                # User already in channel - not an error (idempotent behavior)
+                already_members.append(user_id)
+            else:
+                # Other errors are real problems
+                raise RuntimeError(f"Slack API error for user {user_id}: {error_msg}") from e
+
+    # Build CSV response
+    output = io.StringIO()
+    fieldnames = ["channelID", "invited_users", "already_members"]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerow({
+        "channelID": resolved_channel,
+        "invited_users": ",".join(invited_users) if invited_users else "",
+        "already_members": ",".join(already_members) if already_members else "",
+    })
+    return output.getvalue()
+
+
+@mcp.tool
+def channels_remove_user(
+    channel_id: Annotated[str, Field(description="Channel ID or name (e.g., C1234567890 or #project-alpha)")],
+    user_id: Annotated[str, Field(description="User ID or @mention to remove (e.g., 'U123' or '@alice')")],
+) -> str:
+    """Remove a user from a Slack channel. Returns result as CSV.
+
+    This tool removes a user from a specified channel. If the user is not
+    in the channel, returns a 'not_in_channel' status (not an error).
+
+    Requires SLACK_MCP_CHANNEL_MANAGEMENT=true to be enabled.
+    """
+    provider = get_provider()
+
+    # Check if feature is enabled
+    if not is_channel_management_enabled():
+        raise ValueError(
+            "Channel management is disabled. Set SLACK_MCP_CHANNEL_MANAGEMENT=true to enable this feature."
+        )
+
+    # Resolve channel reference to ID
+    resolved_channel = provider.resolve_channel(channel_id)
+    if not resolved_channel:
+        raise ValueError(f"Channel '{channel_id}' not found.")
+
+    # Resolve user reference to ID
+    resolved_user = provider.resolve_user(user_id)
+    if not resolved_user:
+        raise ValueError(f"User '{user_id}' not found.")
+
+    # Try to remove user from channel
+    try:
+        provider.client.conversations_kick(
+            channel=resolved_channel,
+            user=resolved_user,
+        )
+        status = "removed"
+    except SlackApiError as e:
+        error_msg = e.response.get("error", "unknown_error")
+        if error_msg == "not_in_channel":
+            # User wasn't in channel - not an error (idempotent behavior)
+            status = "not_in_channel"
+        else:
+            # Other errors are real problems
+            raise RuntimeError(f"Slack API error: {error_msg}") from e
+
+    # Build CSV response
+    output = io.StringIO()
+    fieldnames = ["channelID", "user_id", "status"]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerow({
+        "channelID": resolved_channel,
+        "user_id": resolved_user,
+        "status": status,
+    })
+    return output.getvalue()
 
 
 # ---------- Resources ----------
