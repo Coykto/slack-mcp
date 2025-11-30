@@ -370,44 +370,56 @@ class SlackProvider:
         This creates or returns an existing DM channel with the given user.
         The result is cached for future lookups.
         
+        Tries bot_client first, then user_client if available (needed for bot DMs).
+        
         Args:
             user_id: The Slack user ID (Uxxxxxxxx format)
             
         Returns:
             The Channel object for the DM, or None if failed.
         """
-        try:
-            response = self.bot_client.conversations_open(users=[user_id])
-            if not response.get("ok"):
-                logger.warning(f"Failed to open DM with {user_id}: {response.get('error')}")
-                return None
-            
-            channel_data = response.get("channel", {})
-            channel_id = channel_data.get("id")
-            if not channel_id:
-                return None
-            
-            # Check if already cached
-            if channel_id in self._channels:
-                return self._channels[channel_id]
-            
-            # Create channel from response
-            channel = self._map_channel({
-                "id": channel_id,
-                "is_im": True,
-                "user": user_id,
-            })
-            
-            # Cache the channel
-            self._channels[channel_id] = channel
-            self._channels_inv[channel.name] = channel_id
-            
-            logger.info(f"Opened DM with {user_id}: {channel_id} ({channel.name})")
-            return channel
-            
-        except Exception as e:
-            logger.warning(f"Failed to open DM with {user_id}: {e}")
-            return None
+        # Try both clients - bot first, then user (user token needed for bot DMs)
+        clients_to_try = [self.bot_client]
+        if self.user_client:
+            clients_to_try.append(self.user_client)
+        
+        last_error = None
+        for client in clients_to_try:
+            try:
+                response = client.conversations_open(users=[user_id])
+                if not response.get("ok"):
+                    last_error = response.get("error")
+                    continue
+                
+                channel_data = response.get("channel", {})
+                channel_id = channel_data.get("id")
+                if not channel_id:
+                    continue
+                
+                # Check if already cached
+                if channel_id in self._channels:
+                    return self._channels[channel_id]
+                
+                # Create channel from response
+                channel = self._map_channel({
+                    "id": channel_id,
+                    "is_im": True,
+                    "user": user_id,
+                })
+                
+                # Cache the channel
+                self._channels[channel_id] = channel
+                self._channels_inv[channel.name] = channel_id
+                
+                logger.info(f"Opened DM with {user_id}: {channel_id} ({channel.name})")
+                return channel
+                
+            except Exception as e:
+                last_error = str(e)
+                continue
+        
+        logger.warning(f"Failed to open DM with {user_id}: {last_error}")
+        return None
 
     def resolve_channel(self, channel_ref: str) -> str | None:
         """Resolve a channel reference (#name, @name, Uxxxx, or Cxxxx/Dxxxx/Gxxxx) to channel ID.
@@ -434,17 +446,25 @@ class SlackProvider:
             if channel_ref in self._channels:
                 return channel_ref
             # DM channel ID not in cache - try to get channel info
-            try:
-                response = self.bot_client.conversations_info(channel=channel_ref)
-                if response.get("ok"):
-                    channel_data = response.get("channel", {})
-                    channel = self._map_channel(channel_data)
-                    self._channels[channel.id] = channel
-                    self._channels_inv[channel.name] = channel.id
-                    logger.info(f"Cached DM channel from API: {channel.id} ({channel.name})")
-                    return channel_ref
-            except Exception as e:
-                logger.warning(f"Failed to get DM channel info for {channel_ref}: {e}")
+            # Try both clients - bot first, then user (user token may have access to more DMs)
+            clients_to_try = [self.bot_client]
+            if self.user_client:
+                clients_to_try.append(self.user_client)
+            
+            for client in clients_to_try:
+                try:
+                    response = client.conversations_info(channel=channel_ref)
+                    if response.get("ok"):
+                        channel_data = response.get("channel", {})
+                        channel = self._map_channel(channel_data)
+                        self._channels[channel.id] = channel
+                        self._channels_inv[channel.name] = channel.id
+                        logger.info(f"Cached DM channel from API: {channel.id} ({channel.name})")
+                        return channel_ref
+                except Exception:
+                    continue
+            
+            logger.warning(f"Failed to get DM channel info for {channel_ref}")
             return None
 
         # Name references
