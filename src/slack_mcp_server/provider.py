@@ -363,17 +363,110 @@ class SlackProvider:
         channel_id = self._channels_inv.get(name)
         return self._channels.get(channel_id) if channel_id else None
 
+
+    def open_dm(self, user_id: str) -> Channel | None:
+        """Open a DM with a user using conversations.open API.
+        
+        This creates or returns an existing DM channel with the given user.
+        The result is cached for future lookups.
+        
+        Args:
+            user_id: The Slack user ID (Uxxxxxxxx format)
+            
+        Returns:
+            The Channel object for the DM, or None if failed.
+        """
+        try:
+            response = self.bot_client.conversations_open(users=[user_id])
+            if not response.get("ok"):
+                logger.warning(f"Failed to open DM with {user_id}: {response.get('error')}")
+                return None
+            
+            channel_data = response.get("channel", {})
+            channel_id = channel_data.get("id")
+            if not channel_id:
+                return None
+            
+            # Check if already cached
+            if channel_id in self._channels:
+                return self._channels[channel_id]
+            
+            # Create channel from response
+            channel = self._map_channel({
+                "id": channel_id,
+                "is_im": True,
+                "user": user_id,
+            })
+            
+            # Cache the channel
+            self._channels[channel_id] = channel
+            self._channels_inv[channel.name] = channel_id
+            
+            logger.info(f"Opened DM with {user_id}: {channel_id} ({channel.name})")
+            return channel
+            
+        except Exception as e:
+            logger.warning(f"Failed to open DM with {user_id}: {e}")
+            return None
+
     def resolve_channel(self, channel_ref: str) -> str | None:
-        """Resolve a channel reference (#name, @name, or Cxxxx/Dxxxx/Gxxxx) to channel ID."""
+        """Resolve a channel reference (#name, @name, Uxxxx, or Cxxxx/Dxxxx/Gxxxx) to channel ID.
+        
+        Supports:
+        - Direct channel IDs (Cxxxx, Dxxxx, Gxxxx)
+        - Channel names (#general)
+        - DM by username (@username)
+        - User IDs (Uxxxx) - opens a DM with the user
+        """
         channel_ref = channel_ref.strip()
 
+        # User ID reference - open DM
+        if channel_ref.startswith("U"):
+            channel = self.open_dm(channel_ref)
+            return channel.id if channel else None
+
         # Direct ID references
-        if channel_ref.startswith(("C", "D", "G")):
+        if channel_ref.startswith(("C", "G")):
             return channel_ref if channel_ref in self._channels else None
 
+        # DM channel ID - check cache, then try to get info via API
+        if channel_ref.startswith("D"):
+            if channel_ref in self._channels:
+                return channel_ref
+            # DM channel ID not in cache - try to get channel info
+            try:
+                response = self.bot_client.conversations_info(channel=channel_ref)
+                if response.get("ok"):
+                    channel_data = response.get("channel", {})
+                    channel = self._map_channel(channel_data)
+                    self._channels[channel.id] = channel
+                    self._channels_inv[channel.name] = channel.id
+                    logger.info(f"Cached DM channel from API: {channel.id} ({channel.name})")
+                    return channel_ref
+            except Exception as e:
+                logger.warning(f"Failed to get DM channel info for {channel_ref}: {e}")
+            return None
+
         # Name references
-        if channel_ref.startswith(("#", "@")):
+        if channel_ref.startswith("#"):
             return self._channels_inv.get(channel_ref)
+
+        # DM by username - check cache first, then open DM
+        if channel_ref.startswith("@"):
+            # Check cache first
+            cached_id = self._channels_inv.get(channel_ref)
+            if cached_id:
+                return cached_id
+            
+            # Not in cache - resolve username to user ID and open DM
+            username = channel_ref[1:]  # Remove @ prefix
+            user = self.get_user_by_name(username)
+            if user:
+                channel = self.open_dm(user.id)
+                return channel.id if channel else None
+            
+            logger.warning(f"User '{username}' not found for DM")
+            return None
 
         return None
 
