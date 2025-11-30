@@ -4,13 +4,19 @@
 
 ## Environment Setup
 
+**Required Tokens:**
+The server requires TWO Slack tokens:
+- **Bot token** (`xoxb-...`): Used for most operations (channel management, posting, reading)
+- **User token** (`xoxp-...`): Used for search and when `token_type='user'` is specified
+
 **For Main Agent - Before Running Tests:**
 ```bash
-# Read the token from user's shell:
-echo "SLACK_API_TOKEN=$SLACK_API_TOKEN"
+# Read both tokens from user's shell:
+echo "SLACK_MCP_BOT_TOKEN=$SLACK_MCP_BOT_TOKEN"
+echo "SLACK_MCP_USER_TOKEN=$SLACK_MCP_USER_TOKEN"
 ```
 
-Then pass the value explicitly to the subagent prompt (never store tokens in memory files).
+Then pass both values explicitly to the subagent prompt (never store tokens in memory files).
 
 ## Subagent Testing Approach
 
@@ -32,7 +38,8 @@ async def test():
     server_params = StdioServerParameters(
         command='uv',
         args=['run', '--directory', '/Users/eb/PycharmProjects/slack-mcp', 'slack-mcp-server',
-              '--xoxp-token', '<SLACK_API_TOKEN>']
+              '--bot-token', '<SLACK_MCP_BOT_TOKEN>',
+              '--user-token', '<SLACK_MCP_USER_TOKEN>']
     )
 
     async with stdio_client(server_params) as (read, write):
@@ -59,7 +66,8 @@ Lists channels by type.
 result = await session.call_tool('channels_list', {
     'channel_types': 'public_channel',  # or 'private_channel', 'im', 'mpim'
     'sort': 'popularity',  # optional
-    'limit': 10
+    'limit': 10,
+    'token_type': 'bot'  # optional: 'bot' (default) or 'user'
 })
 ```
 
@@ -68,7 +76,8 @@ Gets messages from a channel or DM.
 ```python
 result = await session.call_tool('conversations_history', {
     'channel_id': '#general',  # or 'Cxxxxxxxxxx' or '@username'
-    'limit': '1d'  # or '1w', '30d', or numeric like '50'
+    'limit': '1d',  # or '1w', '30d', or numeric like '50'
+    'token_type': 'bot'  # optional: 'bot' (default) or 'user'
 })
 ```
 
@@ -78,18 +87,20 @@ Gets thread replies.
 result = await session.call_tool('conversations_replies', {
     'channel_id': '#general',
     'thread_ts': '1234567890.123456',  # from a message with replies
-    'limit': '1d'
+    'limit': '1d',
+    'token_type': 'bot'  # optional: 'bot' (default) or 'user'
 })
 ```
 
 ### 4. conversations_search_messages
-Searches messages with filters.
+Searches messages with filters. **Note:** Defaults to user token (required for search API).
 ```python
 result = await session.call_tool('conversations_search_messages', {
     'search_query': 'project update',
     'filter_in_channel': '#general',  # optional
     'filter_date_after': '2024-01-01',  # optional
-    'limit': 10
+    'limit': 10,
+    'token_type': 'user'  # optional: 'user' (default) or 'bot'
 })
 ```
 
@@ -100,7 +111,8 @@ Posts a message (disabled by default).
 result = await session.call_tool('conversations_add_message', {
     'channel_id': '#test-channel',
     'payload': 'Hello from MCP test!',
-    'thread_ts': '1234567890.123456'  # optional, for replies
+    'thread_ts': '1234567890.123456',  # optional, for replies
+    'token_type': 'bot'  # optional: 'bot' (default) or 'user'
 })
 ```
 
@@ -129,7 +141,8 @@ async def test_all():
     server_params = StdioServerParameters(
         command='uv',
         args=['run', '--directory', '/Users/eb/PycharmProjects/slack-mcp', 'slack-mcp-server',
-              '--xoxp-token', '<SLACK_API_TOKEN>']
+              '--bot-token', '<SLACK_MCP_BOT_TOKEN>',
+              '--user-token', '<SLACK_MCP_USER_TOKEN>']
     )
 
     results = []
@@ -209,18 +222,20 @@ You are testing the Slack MCP server.
 
 **Environment:**
 - Project directory: /Users/eb/PycharmProjects/slack-mcp
-- Slack token: <VALUE_FROM_ECHO_COMMAND>
+- Bot token: <VALUE_FROM_ECHO_COMMAND>
+- User token: <VALUE_FROM_ECHO_COMMAND>
 
 **Task:**
 Run the MCP client test pattern to verify all tools work correctly.
 Use `uv run python -c "..."` with inline code - do NOT create test files.
 
 **Required Tests:**
-1. List available tools
+1. List available tools (verify all 8 tools present with token_type parameter)
 2. Test channels_list with public_channel type
 3. Test conversations_history on a channel
-4. Test conversations_search_messages with a query
-5. List and read resources
+4. Test conversations_search_messages with a query (uses user token by default)
+5. Test token_type parameter: call conversations_history with token_type='user'
+6. List and read resources
 
 **Report Format:**
 For each test, report:

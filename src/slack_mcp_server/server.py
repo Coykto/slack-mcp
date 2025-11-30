@@ -7,14 +7,17 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
 from pydantic import Field
+from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from .provider import SlackProvider
 from .text_utils import attachments_to_csv_suffix, is_unfurling_enabled, process_text, timestamp_to_iso
+
+TokenType = Literal["bot", "user"]
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +234,7 @@ def is_channel_allowed(channel_id: str) -> bool:
     return is_negated  # Allow if negation pattern and not in blocklist
 
 
-def check_channel_ownership(provider: SlackProvider, channel_id: str) -> tuple[bool, dict[str, Any]]:
+def check_channel_ownership(provider: SlackProvider, client: WebClient, channel_id: str) -> tuple[bool, dict[str, Any]]:
     """Check if a channel is owned by this MCP instance.
 
     A channel is considered owned if:
@@ -240,6 +243,7 @@ def check_channel_ownership(provider: SlackProvider, channel_id: str) -> tuple[b
 
     Args:
         provider: The Slack provider instance
+        client: The Slack WebClient to use for API calls
         channel_id: The channel ID to check
 
     Returns:
@@ -248,7 +252,7 @@ def check_channel_ownership(provider: SlackProvider, channel_id: str) -> tuple[b
             - channel_info: Full channel info from Slack API
     """
     try:
-        response = provider.client.conversations_info(channel=channel_id)
+        response = client.conversations_info(channel=channel_id)
         channel = response["channel"]
 
         creator = channel.get("creator", "")
@@ -287,6 +291,27 @@ def resolve_user_list(provider: SlackProvider, user_refs: str) -> list[str]:
     return user_ids
 
 
+def get_client(provider: SlackProvider, token_type: TokenType) -> WebClient:
+    """Get the appropriate Slack WebClient based on token type.
+
+    Args:
+        provider: The SlackProvider instance
+        token_type: Either "bot" or "user"
+
+    Returns:
+        WebClient instance for the requested token type
+
+    Raises:
+        ValueError: If token_type is invalid
+    """
+    if token_type == "bot":
+        return provider.bot_client
+    elif token_type == "user":
+        return provider.user_client
+    else:
+        raise ValueError(f"Invalid token_type: {token_type}. Must be 'bot' or 'user'.")
+
+
 # ---------- Conversation Tools ----------
 
 
@@ -300,9 +325,17 @@ def conversations_history(
     limit: Annotated[
         str, Field(description="Limit: '1d', '1w', '30d', '90d' for time range, or number like '50'")
     ] = "1d",
+    token_type: Annotated[
+        TokenType,
+        Field(description="Token to use: 'bot' (default) or 'user'. Different tokens have different permissions.")
+    ] = "bot",
 ) -> str:
-    """Get messages from a channel or DM. Returns CSV with cursor in last row for pagination."""
+    """Get messages from a channel or DM. Returns CSV with cursor in last row for pagination.
+
+    Use `token_type` to select 'bot' (default) or 'user' token.
+    """
     provider = get_provider()
+    client = get_client(provider, token_type)
 
     # Resolve channel reference to ID
     resolved_channel = provider.resolve_channel(channel_id)
@@ -328,7 +361,7 @@ def conversations_history(
         if cursor:
             params["cursor"] = cursor
 
-        response = provider.client.conversations_history(**params)
+        response = client.conversations_history(**params)
         slack_messages = response.get("messages", [])
 
         # Filter activity messages if needed
@@ -361,9 +394,17 @@ def conversations_replies(
     limit: Annotated[
         str, Field(description="Limit: '1d', '30d', '90d' for time range, or number like '50'")
     ] = "1d",
+    token_type: Annotated[
+        TokenType,
+        Field(description="Token to use: 'bot' (default) or 'user'. Different tokens have different permissions.")
+    ] = "bot",
 ) -> str:
-    """Get thread replies. Returns CSV with cursor in last row for pagination."""
+    """Get thread replies. Returns CSV with cursor in last row for pagination.
+
+    Use `token_type` to select 'bot' (default) or 'user' token.
+    """
     provider = get_provider()
+    client = get_client(provider, token_type)
 
     # Resolve channel reference to ID
     resolved_channel = provider.resolve_channel(channel_id)
@@ -390,7 +431,7 @@ def conversations_replies(
         if cursor:
             params["cursor"] = cursor
 
-        response = provider.client.conversations_replies(**params)
+        response = client.conversations_replies(**params)
         slack_messages = response.get("messages", [])
 
         # Filter activity messages if needed
@@ -418,9 +459,17 @@ def conversations_add_message(
     payload: Annotated[str, Field(description="Message text (markdown or plain text)")],
     thread_ts: Annotated[str | None, Field(description="Thread timestamp to reply to")] = None,
     content_type: Annotated[str, Field(description="'text/markdown' or 'text/plain'")] = "text/markdown",
+    token_type: Annotated[
+        TokenType,
+        Field(description="Token to use: 'bot' (default) or 'user'. Different tokens have different permissions.")
+    ] = "bot",
 ) -> str:
-    """Post a message to a channel or thread. Returns the posted message as CSV."""
+    """Post a message to a channel or thread. Returns the posted message as CSV.
+
+    Use `token_type` to select 'bot' (default) or 'user' token.
+    """
     provider = get_provider()
+    client = get_client(provider, token_type)
 
     # Check if tool is enabled
     tool_config = os.environ.get("SLACK_MCP_ADD_MESSAGE_TOOL", "")
@@ -465,15 +514,15 @@ def conversations_add_message(
             kwargs["unfurl_links"] = False
             kwargs["unfurl_media"] = False
 
-        response = provider.client.chat_postMessage(**kwargs)
+        response = client.chat_postMessage(**kwargs)
 
         # Optionally mark as read
         mark_config = os.environ.get("SLACK_MCP_ADD_MESSAGE_MARK", "")
         if mark_config in ("1", "true", "yes"):
-            provider.client.conversations_mark(channel=resolved_channel, ts=response["ts"])
+            client.conversations_mark(channel=resolved_channel, ts=response["ts"])
 
         # Fetch the posted message
-        history_response = provider.client.conversations_history(
+        history_response = client.conversations_history(
             channel=resolved_channel,
             oldest=response["ts"],
             latest=response["ts"],
@@ -505,15 +554,17 @@ def conversations_search_messages(
     filter_threads_only: Annotated[bool, Field(description="Only return thread messages")] = False,
     cursor: Annotated[str | None, Field(description="Cursor for pagination")] = None,
     limit: Annotated[int, Field(description="Maximum results (1-100)")] = 20,
+    token_type: Annotated[
+        TokenType,
+        Field(description="Token to use: 'user' (default) or 'bot'. Search typically requires user token.")
+    ] = "user",
 ) -> str:
-    """Search messages with filters. Returns CSV with cursor in last row for pagination."""
-    provider = get_provider()
+    """Search messages with filters. Returns CSV with cursor in last row for pagination.
 
-    # Search requires a user token (xoxp-), not a bot token
-    if not provider.user_client:
-        raise ValueError(
-            "Search requires a user token. Set SLACK_MCP_USER_TOKEN environment variable."
-        )
+    Use `token_type` to select 'user' (default, required for search API) or 'bot' token.
+    """
+    provider = get_provider()
+    client = get_client(provider, token_type)
 
     # Build query string
     query_parts = []
@@ -574,7 +625,7 @@ def conversations_search_messages(
             raise ValueError(f"Invalid cursor: {cursor}")
 
     try:
-        response = provider.user_client.search_messages(query=query, count=limit, page=page, highlight=False)
+        response = client.search_messages(query=query, count=limit, page=page, highlight=False)
         matches = response.get("messages", {}).get("matches", [])
         pagination = response.get("messages", {}).get("pagination", {})
 
@@ -638,9 +689,17 @@ def channels_list(
     sort: Annotated[str | None, Field(description="Sort by 'popularity' (member count)")] = None,
     limit: Annotated[int, Field(description="Maximum results (1-999)")] = 100,
     cursor: Annotated[str | None, Field(description="Cursor for pagination")] = None,
+    token_type: Annotated[
+        TokenType,
+        Field(description="Token to use: 'bot' (default) or 'user'. Different tokens have different permissions.")
+    ] = "bot",
 ) -> str:
-    """Get list of channels. Returns CSV with cursor in last row for pagination."""
+    """Get list of channels. Returns CSV with cursor in last row for pagination.
+
+    Use `token_type` to select 'bot' (default) or 'user' token.
+    """
     provider = get_provider()
+    client = get_client(provider, token_type)
 
     ready, err = provider.is_ready()
     if not ready:
@@ -707,6 +766,10 @@ def channels_create(
     name: Annotated[str, Field(description="Channel name (lowercase, numbers, hyphens, underscores; max 80 chars)")],
     is_private: Annotated[bool, Field(description="Create as private channel")] = False,
     description: Annotated[str | None, Field(description="Channel description/purpose")] = None,
+    token_type: Annotated[
+        TokenType,
+        Field(description="Token to use: 'bot' (default) or 'user'. Different tokens have different permissions.")
+    ] = "bot",
 ) -> str:
     """Create a new Slack channel (idempotent). Returns channel info as CSV.
 
@@ -715,8 +778,11 @@ def channels_create(
     instead of creating a new one.
 
     If a channel exists but is NOT managed by this MCP, an error is raised.
+
+    Use `token_type` to select 'bot' (default) or 'user' token.
     """
     provider = get_provider()
+    client = get_client(provider, token_type)
 
     # Check if feature is enabled
     if not is_channel_management_enabled():
@@ -744,7 +810,7 @@ def channels_create(
 
     if cached_channel_id:
         # Channel exists - check ownership
-        is_owned, channel_data = check_channel_ownership(provider, cached_channel_id)
+        is_owned, channel_data = check_channel_ownership(provider, client, cached_channel_id)
 
         if is_owned:
             # Channel is MCP-managed - return it (idempotent behavior)
@@ -766,7 +832,7 @@ def channels_create(
 
     try:
         # Create the channel
-        response = provider.client.conversations_create(
+        response = client.conversations_create(
             name=name,
             is_private=is_private,
         )
@@ -782,7 +848,7 @@ def channels_create(
             purpose_string = MCP_MARKER
 
         # Set the channel purpose
-        provider.client.conversations_setPurpose(
+        client.conversations_setPurpose(
             channel=channel_id,
             purpose=purpose_string,
         )
@@ -814,7 +880,7 @@ def channels_create(
             cached_channel_id = provider._channels_inv.get(f"#{name}")
             if cached_channel_id:
                 # Check ownership
-                is_owned, channel_data = check_channel_ownership(provider, cached_channel_id)
+                is_owned, channel_data = check_channel_ownership(provider, client, cached_channel_id)
 
                 if is_owned:
                     # Channel is MCP-managed - return it
@@ -847,6 +913,10 @@ def channels_create(
 def channels_invite_users(
     channel_id: Annotated[str, Field(description="Channel ID or name (e.g., C1234567890 or #project-alpha)")],
     user_ids: Annotated[str, Field(description="Comma-separated user IDs or @mentions (e.g., 'U123,U456' or '@alice,@bob')")],
+    token_type: Annotated[
+        TokenType,
+        Field(description="Token to use: 'bot' (default) or 'user'. Different tokens have different permissions.")
+    ] = "bot",
 ) -> str:
     """Invite users to a Slack channel. Returns result as CSV.
 
@@ -854,8 +924,11 @@ def channels_invite_users(
     in the channel are silently skipped (idempotent behavior).
 
     Requires SLACK_MCP_CHANNEL_MANAGEMENT=true to be enabled.
+
+    Use `token_type` to select 'bot' (default) or 'user' token.
     """
     provider = get_provider()
+    client = get_client(provider, token_type)
 
     # Check if feature is enabled
     if not is_channel_management_enabled():
@@ -884,7 +957,7 @@ def channels_invite_users(
     # Invite users one by one to handle already_in_channel gracefully
     for user_id in user_id_list:
         try:
-            provider.client.conversations_invite(
+            client.conversations_invite(
                 channel=resolved_channel,
                 users=user_id,
             )
@@ -915,6 +988,10 @@ def channels_invite_users(
 def channels_remove_user(
     channel_id: Annotated[str, Field(description="Channel ID or name (e.g., C1234567890 or #project-alpha)")],
     user_id: Annotated[str, Field(description="User ID or @mention to remove (e.g., 'U123' or '@alice')")],
+    token_type: Annotated[
+        TokenType,
+        Field(description="Token to use: 'bot' (default) or 'user'. Different tokens have different permissions.")
+    ] = "bot",
 ) -> str:
     """Remove a user from a Slack channel. Returns result as CSV.
 
@@ -922,8 +999,11 @@ def channels_remove_user(
     in the channel, returns a 'not_in_channel' status (not an error).
 
     Requires SLACK_MCP_CHANNEL_MANAGEMENT=true to be enabled.
+
+    Use `token_type` to select 'bot' (default) or 'user' token.
     """
     provider = get_provider()
+    client = get_client(provider, token_type)
 
     # Check if feature is enabled
     if not is_channel_management_enabled():
@@ -943,7 +1023,7 @@ def channels_remove_user(
 
     # Try to remove user from channel
     try:
-        provider.client.conversations_kick(
+        client.conversations_kick(
             channel=resolved_channel,
             user=resolved_user,
         )

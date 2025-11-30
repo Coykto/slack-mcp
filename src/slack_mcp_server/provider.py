@@ -61,19 +61,25 @@ class SlackProvider:
             users_cache_path: Path to users cache file
             channels_cache_path: Path to channels cache file
         """
+        # Validate both tokens are provided
+        missing = []
         if not bot_token:
-            raise ValueError("Authentication required: bot_token must be provided")
+            missing.append("SLACK_MCP_BOT_TOKEN")
+        if not user_token:
+            missing.append("SLACK_MCP_USER_TOKEN")
+        if missing:
+            raise ValueError(
+                f"Both bot and user tokens are required. Missing: {', '.join(missing)}"
+            )
 
         # Create SSL context with certifi certificates (fixes macOS SSL issues)
         ssl_context = ssl.create_default_context(cafile=certifi.where())
 
         # Primary client (bot token) - used for most operations
-        self.client = WebClient(token=bot_token, ssl=ssl_context)
+        self.bot_client = WebClient(token=bot_token, ssl=ssl_context)
 
         # User client (user token) - used for search operations
-        self.user_client: WebClient | None = None
-        if user_token:
-            self.user_client = WebClient(token=user_token, ssl=ssl_context)
+        self.user_client: WebClient = WebClient(token=user_token, ssl=ssl_context)
 
         self._workspace: str | None = None
         self._team_id: str | None = None
@@ -101,7 +107,7 @@ class SlackProvider:
 
     def auth_test(self) -> dict[str, Any]:
         """Test authentication and return workspace info."""
-        response = self.client.auth_test()
+        response = self.bot_client.auth_test()
         self._workspace = self._extract_workspace(response.get("url", ""))
         self._team_id = response.get("team_id")
         self._user_id = response.get("user_id")
@@ -151,7 +157,7 @@ class SlackProvider:
 
         # Fetch from API
         try:
-            response = self.client.users_list(limit=1000)
+            response = self.bot_client.users_list(limit=1000)
             users_data = response.get("members", [])
 
             users_to_cache = []
@@ -270,7 +276,7 @@ class SlackProvider:
 
         while True:
             try:
-                response = self.client.conversations_list(
+                response = self.bot_client.conversations_list(
                     types=channel_type,
                     limit=999,
                     exclude_archived=True,
